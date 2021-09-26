@@ -73,7 +73,7 @@ keys({file, BaseDir}) ->
 keys({ecc, Props}) when is_list(Props) ->
     KeySlot0 = proplists:get_value(key_slot, Props, 0),
     OnboardingKeySlot = proplists:get_value(onboarding_key_slot, Props, 15),
-    Bus = proplists:get_value(bus, Props, "i2c-1"),
+    Bus = proplists:get_value(bus, Props, "i2c-10"),
     Address = proplists:get_value(address, Props, 16#60),
     {ok, ECCPid} = case whereis(miner_ecc_worker) of
                        undefined ->
