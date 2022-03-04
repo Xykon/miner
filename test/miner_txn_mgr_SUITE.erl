@@ -1,3 +1,4 @@
+%%% RELOC KEEP - works with consensus group
 -module(miner_txn_mgr_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
@@ -417,10 +418,6 @@ txn_from_future_via_protocol_v1_test(Cfg) ->
         end,
     AssertSubmissionCallbackResult =
         fun(LaggingNodeSubmissionResult) ->
-            ct:pal(
-                ">>> LaggingNodeSubmissionResult: ~p",
-                [LaggingNodeSubmissionResult]
-            ),
             ?assertMatch({error, _}, LaggingNodeSubmissionResult)
         end,
     txn_from_future_test(

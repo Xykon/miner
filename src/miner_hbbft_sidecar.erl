@@ -146,7 +146,6 @@ handle_call({submit, Txn}, From,
                             case blockchain_txn:absorb(Txn, Chain) of
                                 ok ->
                                     spawn(fun() ->
-                                        lager:warning("absorbed ok. spawning relcast handle_command txn: ~p", [blockchain_txn:print(Txn)]),
                                                 catch libp2p_group_relcast:handle_command(Group, {txn, Txn})
                                         end),
                                     {reply, {ok, Height}, State};
@@ -197,7 +196,6 @@ handle_cast(_Msg, State) ->
 
 handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chain, group = Group} = State)
   when is_reference(Ref) ->
-    {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
     case maps:get(Ref, Validations, undefined) of
         undefined ->
             lager:warning("response for unknown ref"),
@@ -210,7 +208,6 @@ handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chai
                             ok ->
                                 %% avoid deadlock by not waiting for this.
                                 spawn(fun() ->
-                                    lager:warning("absorbed ok. spawning relcast handle_command txn: ~p", [blockchain_txn:print(Txn)]),
                                               catch libp2p_group_relcast:handle_command(Group, {txn, Txn})
                                       end),
                                 ok;
@@ -218,11 +215,11 @@ handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chai
                                 lager:warning("speculative absorb failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
                                 Error
                         end;
-                    deadline ->
+                    {error, validation_deadline}=Error ->
                         erlang:exit(Pid, kill),
                         write_txn("timed out", Height, Txn),
                         lager:warning("validation timed out for ~s", [blockchain_txn:print(Txn)]),
-                        {error, validation_deadline};
+                        Error;
                     {error, Error} ->
                         write_txn("failed", Height, Txn),
                         lager:warning("is_valid failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
@@ -233,13 +230,18 @@ handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chai
             Validations1 = maps:remove(Ref, Validations),
             {noreply, maybe_start_validation(State#state{validations = Validations1})}
     end;
-handle_info({'DOWN', Ref, process, _Pid, Reason}, #state{validations = Validations} = State) ->
+handle_info(
+    {'DOWN', Ref, process, _Pid, Reason},
+    #state{validations = Validations, chain = Chain} = State
+) ->
+    {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
     case maps:to_list(maps:filter(
                         fun(_K, #validation{monitor = MRef}) when Ref == MRef -> true;
                            (_, _) -> false end,
                         Validations)) of
         [{Attempt, #validation{from = From}}] ->
-            gen_server:reply(From, {error, validation_crashed}),
+            Result = {error, validation_crashed},
+            gen_server:reply(From, {Result, Height}),
             Validations1 = maps:remove(Attempt, Validations),
             {noreply, maybe_start_validation(State#state{validations = Validations1})};
         _ ->
@@ -253,10 +255,12 @@ handle_info(_Info, State) ->
     lager:warning("unexpected message ~p", [_Info]),
     {noreply, State}.
 
-terminate(_Reason, #state{validations = Validations}) ->
+terminate(_Reason, #state{validations = Validations, chain = Chain}) ->
+    {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
+    Result = {error, exiting},
     maps:map(
       fun(_K, #validation{from = From, pid = Pid}) ->
-              gen_server:reply(From, {error, exiting}),
+              gen_server:reply(From, {Result, Height}),
               erlang:exit(Pid, kill)
       end, Validations),
     ok.
@@ -329,6 +333,6 @@ start_validation(Txn, Height, From, Timeout, Chain) ->
                       end,
                     Owner ! {Attempt, {Result, Height}}
           end),
-    TRef = erlang:send_after(Timeout, self(), {Attempt, deadline}),
+    TRef = erlang:send_after(Timeout, self(), {Attempt, {{error, validation_deadline}, Height}}),
     {Attempt,
      #validation{timer = TRef, monitor = Ref, txn = Txn, pid = Pid, from = From, height=Height}}.
