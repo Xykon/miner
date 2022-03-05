@@ -278,7 +278,7 @@ signed_block(Signatures, BinBlock) ->
                 end,
 
             libp2p_group_gossip:send(
-              libp2p_swarm:gossip_group(SwarmTID),
+              SwarmTID,
               ?GOSSIP_PROTOCOL_V1,
               Data
              ),
@@ -322,7 +322,7 @@ remove_consensus() ->
 version() ->
     %% format:
     %% MMMmmmPPPP
-       0010050006.
+       0010080003.
 
 %% ------------------------------------------------------------------
 %% gen_server
@@ -362,10 +362,9 @@ handle_call({create_block, Metadata, Txns, HBBFTRound}, _From,
 handle_call(keys, _From, State) ->
     {reply, {ok, State#state.swarm_keys}, State};
 handle_call(reset_late_block_timer, _From, State) ->
-    %% we do this when the group thinks that it's agreed on a new round, so set the timer extra long
     erlang:cancel_timer(State#state.late_block_timer),
     LateBlockTimeout = application:get_env(miner, late_block_timeout_seconds, 120),
-    LateTimer = erlang:send_after((LateBlockTimeout * 2) * 1000, self(), late_block_timeout),
+    LateTimer = erlang:send_after(LateBlockTimeout * 1000, self(), late_block_timeout),
 
     {reply, ok, State#state{late_block_timer = LateTimer}};
 handle_call(_Msg, _From, State) ->

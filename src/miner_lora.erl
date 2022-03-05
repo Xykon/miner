@@ -10,7 +10,8 @@
     port/0,
     position/0,
     location_ok/0,
-    region/0
+    region/0,
+    route/1
 ]).
 
 -export([
@@ -170,6 +171,8 @@ reg_domain_data_for_addr(Addr, #state{chain=Chain}) ->
                 {ok, V} when V > 10 ->
                     %% check if the poc 11 vars are active yet
                     case blockchain_ledger_v1:find_gateway_location(Addr, Ledger) of
+                        {ok, undefined} ->
+                            {error, no_location};
                         {ok, Location} ->
                             case blockchain_region_v1:h3_to_region(Location, Ledger) of
                                 {ok, Region} ->
@@ -597,7 +600,7 @@ handle_packets(_Packets, _Gateway, _RxInstantLocal_us, #state{reg_domain_confirm
     State;
 handle_packets([Packet|Tail], Gateway, RxInstantLocal_us, #state{reg_region = Region, chain = Chain} = State) ->
     Data = base64:decode(maps:get(<<"data">>, Packet)),
-    case route(Data) of
+    case ?MODULE:route(Data) of
         error ->
             ok;
         {onion, Payload} ->
@@ -617,6 +620,9 @@ handle_packets([Packet|Tail], Gateway, RxInstantLocal_us, #state{reg_region = Re
                 channel(Freq, State#state.reg_freq_list),
                 maps:get(<<"datr">>, Packet)
             );
+        {noop, non_longfi} ->
+            lager:debug("Miner dropping non-Longfi packet ~p", [Packet]),
+            ok;
         {Type, RoutingInfo} ->
             lager:notice("Routing ~p", [RoutingInfo]),
             erlang:spawn(fun() -> send_to_router(Type, RoutingInfo, Packet, Region) end)
@@ -627,7 +633,7 @@ handle_packets([Packet|Tail], Gateway, RxInstantLocal_us, #state{reg_region = Re
  route(Pkt) ->
     case longfi:deserialize(Pkt) of
         error ->
-            route_non_longfi(Pkt);
+            handle_non_longfi(Pkt);
         {ok, LongFiPkt} ->
             %% hello longfi, my old friend
             try longfi:type(LongFiPkt) == monolithic andalso longfi:oui(LongFiPkt) == 0 andalso longfi:device_id(LongFiPkt) == 1 of
@@ -636,10 +642,17 @@ handle_packets([Packet|Tail], Gateway, RxInstantLocal_us, #state{reg_region = Re
                 false ->
                     %% we currently don't expect non-onion packets,
                     %% this is probably a false positive on a LoRaWAN packet
-                      route_non_longfi(Pkt)
+                      handle_non_longfi(Pkt)
             catch _:_ ->
-                      route_non_longfi(Pkt)
+                      handle_non_longfi(Pkt)
             end
+    end.
+
+-spec handle_non_longfi(binary()) -> any().
+handle_non_longfi(Packet) ->
+    case application:get_env(miner, gateway_and_mux_enable) of
+        {ok, true} -> {noop, non_longfi};
+        _ -> route_non_longfi(Packet)
     end.
 
 % Some binary madness going on here
@@ -688,7 +701,7 @@ send_to_router(Type, RoutingInfo, Packet, Region) ->
 -spec country_code_for_addr(libp2p_crypto:pubkey_bin()) -> {ok, binary()} | {error, failed_to_find_geodata_for_addr}.
 country_code_for_addr(Addr)->
     B58Addr = libp2p_crypto:bin_to_b58(Addr),
-    URL = "https://api.helium.io/v1/hotspots/" ++ B58Addr,
+    URL = application:get_env(miner, api_base_url, "https://api.helium.io/v1") ++ "/hotspots/" ++ B58Addr,
     case httpc:request(get, {URL, []}, [{timeout, 5000}],[]) of
         {ok, {{_HTTPVersion, 200, _RespBody}, _Headers, JSONBody}} = Resp ->
             lager:debug("hotspot info response: ~p", [Resp]),
@@ -789,24 +802,37 @@ tmst_to_local_monotonic_time(Tmst_us, PrevTmst_us, PrevMonoTime_us) ->
 %% GWMP JSON V1/V2.
 -spec packet_rssi(map(), boolean()) -> number().
 packet_rssi(Packet, UseRSSIS) ->
-    case maps:get(<<"rssi">>, Packet, undefined) of
-        %% GWMP V2
+    RSSIS = maps:get(<<"rssis">>, Packet, undefined),
+    SingleRSSI = case UseRSSIS andalso RSSIS =/= undefined of
+        true  -> RSSIS;
+        false -> maps:get(<<"rssi">>, Packet, undefined)
+    end,
+    case SingleRSSI of
+        %% No RSSI, perhaps this is a GWMP V2
         undefined ->
             %% `rsig` is a list. It can contain more than one signal
             %% quality object if the packet was received on multiple
             %% antennas/receivers. So let's pick the one with the
-            %% highest RSSI[Channel]
-            Key = case UseRSSIS andalso maps:is_key(<<"rssis">>, Packet) of
+            %% highest RSSI.
+            FetchRSSI = case UseRSSIS of
                 true ->
-                    <<"rssis">>;
-                _ ->
-                    <<"rssic">>
+                    %% Use RSSIS if available, fall back to RSSIC.
+                    fun (Obj) ->
+                        maps:get(<<"rssis">>, Obj,
+                                 maps:get(<<"rssic">>, Obj, undefined))
+                    end;
+                false ->
+                    %% Just use RSSIC.
+                    fun (Obj) ->
+                        maps:get(<<"rssic">>, Obj, undefined)
+                    end
             end,
+            BestRSSISelector =
+                fun (Obj, Best) ->
+                    erlang:max(Best, FetchRSSI(Obj))
+                end, 
             [H|T] = maps:get(<<"rsig">>, Packet),
-            Selector = fun(Obj, Best) ->
-                               erlang:max(Best, maps:get(Key, Obj))
-                       end,
-            lists:foldl(Selector, maps:get(Key, H), T);
+            lists:foldl(BestRSSISelector, FetchRSSI(H), T);
         %% GWMP V1
         RSSI ->
             RSSI
@@ -986,3 +1012,39 @@ maybe_update_reg_data(#state{pubkey_bin=Addr} = State) ->
 -spec reg_region(State :: state()) -> atom().
 reg_region(State) ->
     State#state.reg_region.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+rssi_fetch_test() ->
+    PacketWithRSSIS = #{
+        <<"rssis">> => 1,    
+        <<"rssi">> => 2
+    },
+    PacketWithoutRSSIS = #{
+        <<"rssi">> => 2
+    },
+    RSIGPacketWithRSSIS = #{
+        <<"rsig">> => [
+            #{ <<"rssis">> => 1, <<"rssic">> => 2 },
+            #{ <<"rssis">> => 3, <<"rssic">> => 4 },
+            #{ <<"rssis">> => -1, <<"rssic">> => 0 }
+        ]
+    },
+    RSIGPacketWithoutRSSIS = #{
+        <<"rsig">> => [
+            #{ <<"rssic">> => 2 },
+            #{ <<"rssic">> => 4 },
+            #{ <<"rssic">> => 0 }
+        ]
+    },
+    ?assertEqual(packet_rssi(PacketWithRSSIS, true), 1),
+    ?assertEqual(packet_rssi(PacketWithRSSIS, false), 2),
+    ?assertEqual(packet_rssi(PacketWithoutRSSIS, true), 2),
+    ?assertEqual(packet_rssi(PacketWithoutRSSIS, false), 2),
+    ?assertEqual(packet_rssi(RSIGPacketWithRSSIS, true), 3),
+    ?assertEqual(packet_rssi(RSIGPacketWithRSSIS, false), 4),
+    ?assertEqual(packet_rssi(RSIGPacketWithoutRSSIS, true), 4),
+    ?assertEqual(packet_rssi(RSIGPacketWithoutRSSIS, false), 4).
+    
+-endif.
